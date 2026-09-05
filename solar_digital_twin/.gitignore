@@ -1,0 +1,7 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Large generated datasets
+data/processed/processed_master_dataset.csv
+data/raw/master_multiscenario_dataset.csv
