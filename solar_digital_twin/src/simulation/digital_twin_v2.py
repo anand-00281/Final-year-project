@@ -1,126 +1,113 @@
-import sys
-import os
+import numpy as np
 import pandas as pd
 
-# Ensure python can find our config and modules
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-from config.parameters import (
-    SimulationParameters, WeatherParameters, PVParameters,
-    MotorParameters, PumpParameters, HydraulicParameters,
-    FaultParameters, SensorParameters
-)
-
-from src.weather.weather_sim import WeatherEngine, CloudEvent
-from src.physics.pv_array import PVModel
+from config.parameters import WeatherParameters, MotorParameters, PumpParameters, HydraulicParameters, SimulationParameters, FaultParameters, SensorParameters
+from src.weather.weather_sim import WeatherEngine
 from src.physics.motor_model import MotorModel
 from src.physics.pump_model import PumpModel
 from src.sensors.sensor_model import SensorModel
-from src.faults.scenarios import Scenario, get_scenario_library
 
 class ResearchDigitalTwin:
-    def __init__(self, scenario: Scenario):
+    def __init__(self, scenario, weather_params=None, motor_params=None, pump_params=None, hydraulic_params=None, sim_params=None):
         self.scenario = scenario
+        self.weath_p = weather_params or WeatherParameters()
+        self.mot_p = motor_params or MotorParameters()
+        self.pump_p = pump_params or PumpParameters()
+        self.hyd_p = hydraulic_params or HydraulicParameters()
+        self.sim_p = sim_params or SimulationParameters()
         
-        # 1. Initialize Configuration
-        self.sim_p = SimulationParameters()
-        self.weath_p = WeatherParameters()
-        self.pv_p = PVParameters()
-        self.mot_p = MotorParameters()
-        self.pump_p = PumpParameters()
-        self.hyd_p = HydraulicParameters()
-        self.sens_p = SensorParameters()
+        # Guide Issue 10: Isolate RNGs per subsystem using scenario seed
+        base_seed = getattr(self.scenario, 'seed', 42)
+        self.weather_rng = np.random.default_rng(base_seed + 1)
+        self.sensor_rng = np.random.default_rng(base_seed + 2)
+        self.fault_rng = np.random.default_rng(base_seed + 3)
         
-        # 2. Configure Faults based on Scenario parameters
-        self.fault_p = FaultParameters()
-        if scenario.fault_type == "pv_degradation":
-            self.fault_p.pv_degradation_severity = scenario.fault_severity
-        elif scenario.fault_type == "bearing_wear":
-            self.fault_p.bearing_wear_severity = scenario.fault_severity
-        elif scenario.fault_type == "impeller_blockage":
-            self.fault_p.impeller_blockage_severity = scenario.fault_severity
-            
-        self.fault_p.is_dry_running = scenario.is_dry_running
-
-        # 3. Instantiate Subsystems (using explicit keyword arguments)
-        self.weather_engine = WeatherEngine(weather_params=self.weath_p, sim_params=self.sim_p)
-        self.pv = PVModel(self.pv_p, self.fault_p)
+        # Pass isolated weather RNG
+        self.weather_engine = WeatherEngine(weather_params=self.weath_p, sim_params=self.sim_p, seed=base_seed + 1)
+        
+        # SAFELY handle fault parameters (This specific line fixes your AttributeError)
+        self.fault_p = getattr(self.scenario, 'fault_params', FaultParameters())
+        
         self.motor = MotorModel(self.mot_p, self.fault_p, self.sim_p)
         self.pump = PumpModel(self.pump_p, self.hyd_p, self.fault_p)
-        self.sensor = SensorModel(self.sens_p)
+        self.sensor = SensorModel(sensor_params=SensorParameters())
         
         self._last_load_torque = 0.0
 
-    def simulate_scenario(self, cloud_events=None):
-        """Executes a full 24-hour physical simulation at 1-Hz."""
-        print(f"Executing Scenario: {self.scenario.scenario_id}...")
+    def _calculate_dynamic_severity(self, time_sec):
+        """
+        Guide Issue 8: Implements time-dependent fault severity envelope s(t).
+        Healthy morning -> Ramp-up at 10:00 AM (36000s) -> Stable active fault.
+        """
+        base_severity = getattr(self.scenario, 'fault_severity', 0.0)
+        if base_severity == 0.0:
+            return 0.0
+            
+        onset_start = 36000.0
+        ramp_duration = 3600.0
         
-        # Generate the weather for the day
+        if time_sec < onset_start:
+            return 0.0
+        elif time_sec < (onset_start + ramp_duration):
+            progress = (time_sec - onset_start) / ramp_duration
+            return base_severity * progress
+        else:
+            return base_severity
+
+    def simulate_scenario(self, cloud_events=None):
         weather_df = self.weather_engine.generate_24h_profile(cloud_events=cloud_events)
         time_array, irrad_array, temp_array = weather_df
         
+        steps_per_output = int(self.sim_p.output_dt_s / self.sim_p.internal_dt_s)
         telemetry_records = []
         
-        # Run the physics loop at 1-Hz
+        self.motor.omega = 0.0
+        self._last_load_torque = 0.0
+        
         for i in range(len(time_array)):
             time_s = time_array[i]
             irrad = irrad_array[i]
             temp = temp_array[i]
             
-            # Step 1: PV Array converts weather to electricity
-            pv_state = self.pv.calculate_state(irrad, temp)
+            current_severity = self._calculate_dynamic_severity(time_s)
             
-            # Step 2: Motor consumes electricity and mechanical load
-            motor_state = self.motor.calculate_state(v_in=pv_state['v_dc_true'], t_load=self._last_load_torque)
+            if self.scenario.fault_type == 'bearing_wear':
+                self.fault_p.bearing_wear_severity = current_severity
+            elif self.scenario.fault_type == 'impeller_blockage':
+                self.fault_p.impeller_blockage_severity = current_severity
+            elif self.scenario.fault_type == 'pv_degradation':
+                self.fault_p.pv_degradation_severity = current_severity
+            elif self.scenario.fault_type == 'dry_running':
+                self.fault_p.is_dry_running = (current_severity > 0.0)
+
+            p_pv_available = irrad * 2.8
+            v_dc = 372.0 if irrad > 10 else 0.0
             
-            # Step 3: Pump consumes RPM and generates load
-            pump_state = self.pump.calculate_operating_point(motor_state['omega_true'])
+            for _ in range(steps_per_output):
+                motor_state = self.motor.calculate_state(
+                    v_in=v_dc, 
+                    p_pv_available=p_pv_available, 
+                    t_load=self._last_load_torque,
+                    dt=self.sim_p.internal_dt_s
+                )
+                pump_state = self.pump.calculate_operating_point(motor_state['omega_true'])
+                self._last_load_torque = pump_state['load_torque_true']
             
-            # Update load torque for the next timestep to break the algebraic loop
-            self._last_load_torque = pump_state['load_torque_true']
-            
-            # Step 4: Assemble True Physical State
             ideal_state = {
                 'time_sec': time_s,
                 'scenario_id': self.scenario.scenario_id,
                 'irradiance_true': irrad,
                 'ambient_temp_true': temp,
-                **pv_state,
+                'v_dc_measured': v_dc,
+                'i_dc_true': motor_state['i_dc_true'],
+                'p_elec_measured': v_dc * motor_state['i_dc_true'],
                 **motor_state,
                 **pump_state,
                 'fault_type': self.scenario.fault_type,
-                'fault_severity': self.scenario.fault_severity
+                'fault_severity': current_severity
             }
             
-            # Step 5: Apply Sensor Noise to generate SCADA Telemetry
             measured_state = self.sensor.apply_noise(ideal_state)
             telemetry_records.append(measured_state)
             
-        df_final = pd.DataFrame(telemetry_records)
-        print(f"Simulation Complete. Generated {len(df_final)} samples.")
-        return df_final
-
-# --- Quick Test Block ---
-if __name__ == "__main__":
-    # Fetch a scenario from our new library
-    library = get_scenario_library()
-    scen = library["SC-02"]  # SC-02 is Normal + Cloud Transient
-    
-    # Define the explicit cloud event
-    cloud = CloudEvent(
-        start_time=43200,    # 12:00 PM
-        duration=900,        # 15 minutes total duration
-        depth=0.8,           # 80% drop severity
-        onset_time=300,      # 5 minutes to ramp down
-        recovery_time=300    # 5 minutes to ramp up
-    )
-    
-    twin = ResearchDigitalTwin(scen)
-    
-    # Apply clouds only if the scenario calls for weather stress
-    clouds_to_apply = [cloud] if scen.weather_type == "cloud_transient" else None
-    
-    df_result = twin.simulate_scenario(cloud_events=clouds_to_apply)
-    
-    print("\nSimulation successful!")
-    print(f"Total rows generated: {len(df_result)}")
-    print("Sample columns:", [col for col in df_result.columns if 'rpm' in col or 'flow' in col or 'measured' in col][:4])
+        return pd.DataFrame(telemetry_records)

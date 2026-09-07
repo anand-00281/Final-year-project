@@ -10,95 +10,58 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')
 from config.parameters import WeatherParameters, SimulationParameters, rng
 
 @dataclass
+
 class CloudEvent:
-    start_time: int     # Second of the day (e.g., 43200 for 12:00 PM)
-    duration: int       # Total duration in seconds
-    depth: float        # Drop severity (0.0 to 1.0, where 0.8 is an 80% drop)
-    onset_time: int     # Seconds it takes to reach full depth
-    recovery_time: int  # Seconds it takes to recover to full sun
+    def __init__(self, start_time, duration, depth, onset_time, recovery_time):
+        self.start_time = start_time
+        self.duration = duration
+        self.depth = depth
+        self.onset_time = onset_time
+        self.recovery_time = recovery_time
 
 class WeatherEngine:
-    def __init__(self, weather_params: WeatherParameters, sim_params: SimulationParameters):
+    def __init__(self, weather_params, sim_params, seed=42):
         self.wp = weather_params
         self.sp = sim_params
-        
-        # 24 hours * 3600 seconds = 86400 samples for a 1-Hz simulation
-        self.total_seconds = int(24 * 3600 / self.sp.internal_dt)
-        self.time_array = np.arange(0, self.total_seconds * self.sp.internal_dt, self.sp.internal_dt)
+        self.rng = np.random.default_rng(seed)
+        self.total_seconds = int(24 * 3600 / self.sp.output_dt_s)
+        # Initialize time array explicitly here
+        self.time_array = np.arange(0, self.total_seconds, self.sp.output_dt_s)
 
-    def generate_day(self, cloud_events=None, noise_std=5.0):
-        """
-        Generates a 24-hour weather profile returned as a pandas DataFrame.
-        Columns: time_hrs, irradiance, temperature
-        """
-        t, irrad, temp = self.generate_24h_profile(cloud_events=cloud_events, noise_std=noise_std)
-        return pd.DataFrame({
-            'time_hrs': t / 3600.0,
-            'irradiance': irrad,
-            'temperature': temp
-        })
-
-    def generate_24h_profile(self, cloud_events=None, noise_std=5.0):
-        """
-        Generates 1-Hz environmental data over 24 hours.
-        Combines Layer A (Clear Sky), Layer B (Noise), and Layer C (Clouds).
-        """
+    def generate_24h_profile(self, cloud_events=None):
+        n_steps = len(self.time_array)
+        irradiance = np.zeros(n_steps)
+        temperature = np.zeros(n_steps)
         
-        # --- LAYER A: Clear Sky Deterministic Envelope ---
-        # Sunrise at 6 AM (21,600s), Sunset at 6 PM (64,800s)
-        sun_start, sun_end = 6 * 3600, 18 * 3600
+        sun_start = 21600.0
+        sun_end = 64800.0
         
-        irrad = np.zeros(self.total_seconds)
         sun_mask = (self.time_array >= sun_start) & (self.time_array <= sun_end)
+        day_times = self.time_array[sun_mask]
         
-        # Ideal sine wave for irradiance
-        irrad[sun_mask] = self.wp.peak_irradiance * np.sin(
-            np.pi * (self.time_array[sun_mask] - sun_start) / (sun_end - sun_start)
-        )
-        
-        # --- LAYER B: Stochastic Variability ---
-        # Use the controlled RNG from parameters.py to ensure reproducibility
-        noise = rng.normal(0, noise_std, self.total_seconds)
-        irrad = np.clip(irrad + noise, 0, None)
-        
-        # --- LAYER C: Explicit Cloud Events ---
-        cloud_multiplier = np.ones(self.total_seconds)
+        if len(day_times) > 0:
+            peak_irrad = self.wp.peak_irradiance
+            sin_curve = np.sin(np.pi * (day_times - sun_start) / (sun_end - sun_start))
+            clear_irrad = peak_irrad * sin_curve
+            
+            noise = self.rng.normal(0, self.wp.noise_std, size=len(day_times))
+            irradiance[sun_mask] = np.clip(clear_irrad + noise, 0.0, peak_irrad)
+            
+            base_temp = self.wp.base_temp
+            temp_amplitude = self.wp.temp_amplitude
+            temperature[sun_mask] = base_temp + temp_amplitude * sin_curve + self.rng.normal(0, 0.5, size=len(day_times))
         
         if cloud_events:
-            t = self.time_array
-            for event in cloud_events:
-                # Boolean masks for vectorized performance
-                in_onset = (t >= event.start_time) & (t < event.start_time + event.onset_time)
-                in_recovery = (t > event.start_time + event.duration - event.recovery_time) & (t <= event.start_time + event.duration)
-                in_full = (t >= event.start_time + event.onset_time) & (t <= event.start_time + event.duration - event.recovery_time)
+            for cloud in cloud_events:
+                c_start = cloud.start_time
+                c_end = c_start + cloud.duration
                 
-                multiplier = np.ones(self.total_seconds)
-                
-                # Apply V-shape or U-shape drops
-                if event.onset_time > 0:
-                    multiplier[in_onset] = 1.0 - event.depth * ((t[in_onset] - event.start_time) / event.onset_time)
-                
-                multiplier[in_full] = 1.0 - event.depth
-                
-                if event.recovery_time > 0:
-                    multiplier[in_recovery] = 1.0 - event.depth * ((event.start_time + event.duration - t[in_recovery]) / event.recovery_time)
-                    
-                cloud_multiplier *= multiplier
-
-        # Apply clouds to irradiance
-        irrad = irrad * cloud_multiplier
-        
-        # --- TEMPERATURE MODEL ---
-        # Temp lags behind irradiance by ~2 hours
-        temp = np.full(self.total_seconds, self.wp.base_temp)
-        temp_start, temp_end = 8 * 3600, 20 * 3600
-        temp_mask = (self.time_array >= temp_start) & (self.time_array <= temp_end)
-        
-        temp[temp_mask] = self.wp.base_temp + (self.wp.peak_temp - self.wp.base_temp) * np.sin(
-            np.pi * (self.time_array[temp_mask] - temp_start) / (temp_end - temp_start)
-        )
-        
-        return self.time_array, irrad, temp
+                for i, t in enumerate(self.time_array):
+                    if c_start <= t <= c_end:
+                        irradiance[i] *= (1.0 - cloud.depth)
+                        
+        irradiance = np.maximum(0.0, irradiance)
+        return self.time_array, irradiance, temperature
 
 # --- Quick Test Block ---
 if __name__ == "__main__":

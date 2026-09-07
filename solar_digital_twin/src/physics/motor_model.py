@@ -14,47 +14,46 @@ class MotorModel:
         # The critical dynamic state variable (Angular Velocity in rad/s)
         self.omega_rad_s = 0.0
 
-    def calculate_state(self, v_in: float, t_load: float = 0.0):
+    def calculate_state(self, v_in, p_pv_available, t_load, dt):
         """
-        Calculates the dynamic physical state of the motor.
-        v_in: Input voltage (from PV/Inverter)
-        t_load: Mechanical load torque exerted by the water in the pump
+        v_in: DC voltage from PV
+        p_pv_available: Maximum power available from PV array
+        t_load: Load torque from pump
+        dt: internal timestep (0.05s)
         """
-        # 1. INJECT FAULT: Bearing Wear
-        # Increases the base mechanical friction based on severity (0.0 to 1.0)
-        # We use a multiplier of 10 to simulate severe bearing failure at max severity
-        b_effective = self.params.b_m_base * (1.0 + 10.0 * self.faults.bearing_wear_severity)
-
-        # 2. Electrical Equations
-        # Calculate Back-EMF (E = Ke * omega)
+        # 1. Back EMF
         e_back = self.params.k_e * self.omega_rad_s
         
-        # Calculate Motor Current (I = (V - E) / R)
-        i_motor = max(0.0, (v_in - e_back) / self.params.r_m)
-
-        # 3. Mechanical Equations
-        # Calculate Electromagnetic Torque (Te = Kt * I)
-        t_e = self.params.k_t * i_motor
+        # 2. Electrical coupling constraint (The Guide's Critical Issue 3 fix)
+        # Motor wants this current:
+        i_desired = (v_in - e_back) / self.params.r_m
         
-        # Calculate Friction Torque
+        # But PV can only supply this maximum current:
+        i_max_pv = (p_pv_available / v_in) if v_in > 0 else 0.0
+        
+        # The actual current is bounded by the PV capability and cannot be negative
+        i_actual = max(0.0, min(i_desired, i_max_pv))
+        
+        # 3. Torque & Integration
+        t_e = self.params.k_t * i_actual
+        
+        # Apply bearing wear if active
+        b_effective = self.params.b_m * (1 + 10 * self.faults.bearing_wear_severity)
         t_friction = b_effective * self.omega_rad_s
         
-        # 4. Differential Equation for Rotor Dynamics
-        # J * (d_omega / dt) = T_e - T_load - T_friction
+        # ODE: d(omega)/dt = (Te - T_load - T_friction) / J
         net_torque = t_e - t_load - t_friction
+        d_omega = net_torque / self.params.j
         
-        # Euler integration to update the dynamic state
-        d_omega = (net_torque / self.params.j_rotor) * self.dt
-        self.omega_rad_s = max(0.0, self.omega_rad_s + d_omega)
-
-        # 5. Convert to RPM for telemetry
-        rpm = self.omega_rad_s * (60.0 / (2 * 3.14159))
-
+        # Euler integration using the micro-timestep
+        self.omega_rad_s += d_omega * dt
+        self.omega_rad_s = max(0.0, self.omega_rad_s)  # Cannot spin backwards
+        
         return {
-            'motor_current_true': round(i_motor, 3),
-            'motor_torque_true': round(t_e, 3),
-            'omega_true': round(self.omega_rad_s, 3),
-            'rpm_true': round(rpm, 1)
+            'i_dc_true': i_actual,
+            't_e_true': t_e,
+            'omega_true': self.omega_rad_s,
+            'rpm_true': self.omega_rad_s * (30 / 3.14159)
         }
 
 # --- Quick Test Block ---

@@ -2,16 +2,19 @@ from dataclasses import dataclass
 import numpy as np
 
 @dataclass
+@dataclass
 class SimulationParameters:
-    internal_dt: float = 1.0  # 1-second internal physics resolution
-    output_dt: float = 1.0    # 1-second telemetry output (1-Hz)
-    seed: int = 42            # Strict reproducibility
+    output_dt_s: float = 1.0
+    internal_dt_s: float = 0.05
+    internal_dt: float = 0.05     # Alias to prevent any attribute errors
+    seed: int = 42
 
 @dataclass
 class WeatherParameters:
-    peak_irradiance: float = 1000.0  # W/m2
-    base_temp: float = 15.0          # Celsius
-    peak_temp: float = 35.0          # Celsius
+    peak_irradiance: float = 1000.0
+    noise_std: float = 15.0
+    base_temp: float = 25.0
+    temp_amplitude: float = 12.0         # Celsius
 
 @dataclass
 class PVParameters:
@@ -22,25 +25,26 @@ class PVParameters:
 
 @dataclass
 class MotorParameters:
-    r_m: float = 1.5            # Stator resistance (Ohms)
-    k_e: float = 0.8            # Back-EMF constant (V/(rad/s))
-    k_t: float = 0.8            # Torque constant (Nm/A)
-    j_rotor: float = 0.05       # Rotor inertia (kg*m2)
-    b_m_base: float = 0.01      # Base mechanical friction
+    r_m: float = 1.5        # Armature resistance (ohms)
+    l_m: float = 0.01       # Armature inductance (H)
+    k_t: float = 0.8        # Torque constant (Nm/A)
+    k_e: float = 0.8        # Back-EMF constant (V/(rad/s))
+    j: float = 0.05         # Rotor inertia (kg*m^2)
+    b_m: float = 0.001      # Motor viscous friction coefficient
 
 @dataclass
 class PumpParameters:
-    # Reduced-order coefficients for H_pump = K1*w^2 - K2*w*Q - K3*Q^2
-    k1: float = 0.015
-    k2: float = 0.002
-    k3: float = 0.001
-    
+    k1: float = 0.008     # Increased head coefficient for demo scaling
+    k2: float = 0.00050
+    k3: float = 0.00052
+    eta_pump_base: float = 0.60
+
 @dataclass
 class HydraulicParameters:
-    h_static: float = 30.0      # Static head (meters)
-    k_system: float = 0.005     # Pipe friction/system resistance
-    density: float = 1000.0     # kg/m3
-    gravity: float = 9.81       # m/s2
+    h_static: float = 2.0       # Set to 2 meters for easy startup flow
+    k_system: float = 0.003
+    density: float = 1000.0
+    gravity: float = 9.81
 
 @dataclass
 class FaultParameters:
